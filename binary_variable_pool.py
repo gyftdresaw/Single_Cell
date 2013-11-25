@@ -1,6 +1,7 @@
 
 # simple binary decision making
-# from a fixed pool of progenitors
+# from a variable pool of progenitors
+# (distribution of N progenitors per well)
 #
 # each data sample only indicates
 # the categories fulfilled: 1, 2, or 1&2
@@ -11,18 +12,25 @@ from scipy.misc import comb
 from scipy.stats import beta as beta_distr
 import matplotlib.cm as cm
 from scipy.special import beta as beta_func
+from scipy.signal import convolve2d
+from scipy.signal import fftconvolve
 
 # data set will be contained in the multi-dimensional array
 # D[0][1] = # trials with only category 2 fulfilled
 
-# simulate binary decision process with fixed progenitor pool
-# N: number of progenitors per trial
+# simulate binary decision process with variable progenitor pool
 # T: number of trials
 # p: probability a progenitor differentiates into state 1
-def binary_fixed_sim(N,T,p):
+# pN: array of probabilities of obtaining N progenitors in a well
+#     p(N = 0) should be equal to 0
+def binary_variable_sim(T,p,pN):
     D = np.zeros((2,2))
+    Ntotal = 0
     total = 0
     for i in xrange(T):
+        u = np.random.uniform()
+        # this is a hack to select N = i with prob pN[i]
+        N = min(np.array(range(len(pN)))[u < np.cumsum(pN)])
         t = np.random.binomial(N,p)
         if t == N:
             D[1][0] += 1
@@ -30,18 +38,24 @@ def binary_fixed_sim(N,T,p):
             D[0][1] += 1
         else:
             D[1][1] += 1
+        Ntotal += N
         total += t
-    return D,total
+    return D,Ntotal,total
 
-class BinaryFixedModel:
+class BinaryVariableModel:
     # in init perform fit
-    def __init__(self,D,N,alpha=1.5,beta=1.5):
+    # going to assume pN is already reduced (large N combined in single category)
+    # or approximated so that we're not looking over 
+    # an extremely large number of N possibilities
+    # 
+    # pN[i] should be the probability of N = i
+    def __init__(self,D,pN,alpha=1.5,beta=1.5):
         self.D = D
-        self.N = N
+        self.pN = pN
         # for bayesian inference provide alpha,beta for p prior
         self.alpha = alpha
         self.beta = beta
-        self.fit(D,N)
+        self.fit(D,pN)
 
     # perform convolution step
     def convolute(self,N1s,updater):
@@ -49,18 +63,57 @@ class BinaryFixedModel:
         cv = np.convolve(N1s,updater)
         return cv[:len(N1s)].copy() # don't change length of N1s
 
-    def fit(self,D,N):
+    def convolute2D(self,Ns,updater):
+        r,c = Ns.shape
+        # use the built in scipy convolve2D function
+        cv2D = convolve2d(Ns,updater)
+        return cv2D[:r,:c]
+        # try fftconvolve for speed
+        # 
+        # with appropriate thresholding of Ns, it is no longer incorrect
+        # 200 trials with 4 N options takes ~63.4 seconds to fit
+        # ~57 seconds are spent doing fftn and ifftn back and forth
+        # should be able to get a big speedup from a convolution power function
+        # that doesn't transform back over and over.
+        # cv2DF = fftconvolve(Ns,updater)
+        # return cv2DF[:r,:c]
+
+    def get_updater(self,config,pN):
+        Nmax = len(pN) - 1
+        updater = np.zeros((Nmax+1,Nmax+1)) # hold 2D prob weights to convolute
+        if config == (1,0):
+            for i in xrange(1,Nmax+1):
+                updater[i,i] += pN[i] # all trials contribute to N1
+        elif config == (0,1):
+            for i in xrange(1,Nmax+1):
+                updater[i,0] += pN[i] # all trials contribute to N but not N1
+        elif config == (1,1):
+            for i in xrange(2,Nmax+1):
+                w = 2 ** i - 2 # to weight combination trials
+                for j in xrange(1,i):
+                    updater[i,j] += pN[i] * comb(i,j) / w
+
+        return updater
+
+    def fit(self,D,pN):
         # get number of trials
         T = int(D.sum()) # sum over all elements in D
         self.T = T # save this
-        Ntotal = T * N
-        self.Ntotal = Ntotal # save this 
 
-        # preallocate array for N1 possibilities
-        N1s = np.zeros(Ntotal+1)
-        N1s[0] = 1.0
+        Nmax = len(pN) - 1 # maximum possible N value in a well
+        Ntotalmax = T * Nmax # maximum total possible N's summed up
+        self.Ntotalmax = Ntotalmax # save this 
 
-        w = 2 ** N - 2 # to weight combination trials
+        # preallocate array for (N,N1) possibilities
+        # 2D array with (Ntotalmax x Ntotalmax) possibilities
+        Ns = np.zeros((Ntotalmax + 1,Ntotalmax + 1))
+        Ns[0,0] = 1.0 # without any data full weight on (0,0)
+        
+        # precompute updaters
+        updaters = np.zeros((2,2,Nmax+1,Nmax+1))
+        for i in xrange(0,2):
+            for j in xrange(0,2):
+                updaters[i,j] = self.get_updater((i,j),pN)
 
         # iterate over data matrix
         it = np.nditer(D, flags=['multi_index'])
@@ -68,38 +121,32 @@ class BinaryFixedModel:
             dval = it[0]
             dindex = it.multi_index
 
-            # need to perform convolution on N1s for each recorded trial
+            # need to perform convolution on 2D Ns for each recorded trial
             for i in xrange(dval):
-                updater = np.zeros(N+1) # hold prob weights to convolute by
-                if dindex == (1,0):
-                    updater[N] += 1
-                elif dindex == (0,1):
-                    updater[0] += 1
-                elif dindex == (1,1):
-                    for j in xrange(1,N):
-                        updater[j] += comb(N,j) / w
-                else: # ignore (0,0)
-                    pass
-                N1s = self.convolute(N1s,updater)
-                N1s = N1s / sum(N1s) # just to maintain normalization
+                Ns = self.convolute2D(Ns,updaters[dindex])
+                Ns = Ns / Ns.sum() # just to maintain normalization
             it.iternext()
         
         # save result
-        self.N1s = N1s
+        self.Ns = Ns
+        
         # produce proper weights for beta distributions
-        bweights = np.zeros(Ntotal+1)
-        for i in xrange(len(N1s)):
-            if N1s[i] > 0:
-                bweights[i] = N1s[i] * beta_func(i + self.alpha,Ntotal-i + self.beta)
+        bweights = np.zeros((Ntotalmax+1,Ntotalmax+1))
+        for i in xrange(Ntotalmax+1):
+            for j in xrange(i+1): # can only have at most value N for N1
+                # with the fftconvolve this was overweighting things with beta_func
+                # values O(0.1), threshold 1e-15 works well for fft
+                if Ns[i,j] > 0:
+                    bweights[i,j] = Ns[i,j] * beta_func(j + self.alpha,i-j + self.beta)
 
         # sometimes beta weights are so ridiculously small everything just ends up 0
         # especially I suspect if N is off
-        if sum(bweights) > 0:
-            bweights = bweights / sum(bweights)
+        if bweights.sum() > 0:
+            bweights = bweights / bweights.sum()
         else:
-            bweights = N1s
+            bweights = Ns
         self.bweights = bweights
-        return N1s
+        return Ns
     
     def estimate_p(self):
         if hasattr(self,'exp_p'):
@@ -107,8 +154,9 @@ class BinaryFixedModel:
         # calculate P(heads|D)
         # using means of beta distributions
         exp_p = 0.0
-        for i in xrange(len(self.bweights)):
-            exp_p += self.bweights[i] * (i + self.alpha) / (self.Ntotal + self.alpha + self.beta)
+        for i in xrange(self.Ntotalmax + 1):
+            for j in xrange(i+1):
+                exp_p += self.bweights[i,j] * (j + self.alpha) / (i + self.alpha + self.beta)
         self.exp_p = exp_p
         return exp_p
 
@@ -119,24 +167,35 @@ class BinaryFixedModel:
         # calculate log-likelihood using this estimate
         # not exactly the max-likelihood estimate, but probably reasonable
 
+        # precalc psums
+        psum = np.ones((2,2))
+        psum[1,0] = sum([self.pN[i] * (exp_p ** i) for i in xrange(len(self.pN))])
+        psum[0,1] = sum([self.pN[i] * ((1-exp_p) ** i) for i in xrange(len(self.pN))])
+        psum[1,1] = sum([self.pN[i] * (1 - (exp_p ** i) - ((1 - exp_p) ** i)) for i in xrange(len(self.pN))])
+
         # iterate over data matrix
         loglik = 0.0
         it = np.nditer(self.D, flags=['multi_index'])
         while not it.finished:
             dval = it[0]
             dindex = it.multi_index
-
-            if dindex == (1,0):
-                loglik += dval*self.N*np.log(exp_p)
-            elif dindex == (0,1):
-                loglik += dval*self.N*np.log(1-exp_p)
-            elif dindex == (1,1):
-                loglik += dval*np.log(1 - exp_p ** self.N - (1 - exp_p) ** self.N)
-            else: # ignore (0,0)
-                pass
+            loglik += dval*np.log(psum[dindex])
             it.iternext()
+
         self.loglik = loglik
         return loglik
+
+# some basic tests
+p = np.random.uniform()
+pN = np.array([0.0,0.25,0.25,0.25,0.25])
+D,Nt,N1 = binary_variable_sim(50,p,pN)
+
+C = BinaryVariableModel(D,pN)
+print p
+# print D,Nt,N1
+print C.estimate_p()
+print np.unravel_index(C.bweights.argmax(),C.bweights.shape)
+'''
 
 # N is number of progenitors
 # test data set with N = 3, T = 100, p = 0.5
@@ -189,6 +248,8 @@ plt.title('log-likelihood')
 plt.xlabel('N')
 f.savefig('loglik.png')
 plt.show()
+'''
+
 
 '''
 # now plot distribution of N's predicted
