@@ -77,6 +77,34 @@ class BinaryVariableModel:
         # that doesn't transform back over and over.
         # cv2DF = fftconvolve(Ns,updater)
         # return cv2DF[:r,:c]
+    
+    # direct convolution power calculation
+    # for comparison, this should be 'exact'
+    def convpower2Ddirect(self,dist,M):
+        return reduce(convolve2d,[dist for i in xrange(int(M))])
+
+    # at the very least we can get a speed up to 
+    # O(log(M)) convolutions for calculating 
+    # a convolution power to M, by doing dividing and conquering
+    #
+    # return full convolution, i.e. R+(R-1)*(M-1) x C+(C-1)*(M-1) dist
+    def convpower2D(self,dist,M):
+        final_dists = []
+        power_left = int(M)
+        current_dist = dist
+        while power_left > 0:
+            if power_left % 2:
+                final_dists.append(current_dist)
+            current_dist = fftconvolve(current_dist,current_dist)
+            # maintain normalization and positive values
+            current_dist = (current_dist * (current_dist > 0))
+            current_dist = current_dist / current_dist.sum()
+            power_left = power_left >> 1
+        # convolve final_dists to get result
+        F = reduce(fftconvolve,final_dists)
+        F = F * (F > 0)
+        F = F / F.sum()
+        return F
 
     def get_updater(self,config,pN):
         Nmax = len(pN) - 1
@@ -107,7 +135,6 @@ class BinaryVariableModel:
         # preallocate array for (N,N1) possibilities
         # 2D array with (Ntotalmax x Ntotalmax) possibilities
         Ns = np.zeros((Ntotalmax + 1,Ntotalmax + 1))
-        Ns[0,0] = 1.0 # without any data full weight on (0,0)
         
         # precompute updaters
         updaters = np.zeros((2,2,Nmax+1,Nmax+1))
@@ -115,6 +142,7 @@ class BinaryVariableModel:
             for j in xrange(0,2):
                 updaters[i,j] = self.get_updater((i,j),pN)
 
+        tmp_Ns = []
         # iterate over data matrix
         it = np.nditer(D, flags=['multi_index'])
         while not it.finished:
@@ -122,11 +150,19 @@ class BinaryVariableModel:
             dindex = it.multi_index
 
             # need to perform convolution on 2D Ns for each recorded trial
+            if not dval == 0:
+                tmp_Ns.append(self.convpower2D(updaters[dindex],dval))
+            '''
             for i in xrange(dval):
                 Ns = self.convolute2D(Ns,updaters[dindex])
                 Ns = Ns / Ns.sum() # just to maintain normalization
+            '''
             it.iternext()
         
+        Ns = reduce(fftconvolve,tmp_Ns)
+        Ns = Ns * (Ns > 0)
+        Ns = Ns / Ns.sum()
+
         # save result
         self.Ns = Ns
         
@@ -136,7 +172,7 @@ class BinaryVariableModel:
             for j in xrange(i+1): # can only have at most value N for N1
                 # with the fftconvolve this was overweighting things with beta_func
                 # values O(0.1), threshold 1e-15 works well for fft
-                if Ns[i,j] > 0:
+                if Ns[i,j] > 1e-15:
                     bweights[i,j] = Ns[i,j] * beta_func(j + self.alpha,i-j + self.beta)
 
         # sometimes beta weights are so ridiculously small everything just ends up 0
@@ -186,15 +222,49 @@ class BinaryVariableModel:
         return loglik
 
 # some basic tests
-p = np.random.uniform()
-pN = np.array([0.0,0.25,0.25,0.25,0.25])
-D,Nt,N1 = binary_variable_sim(50,p,pN)
 
-C = BinaryVariableModel(D,pN)
-print p
-# print D,Nt,N1
-print C.estimate_p()
-print np.unravel_index(C.bweights.argmax(),C.bweights.shape)
+# terminating galton-watson process probabilities
+# assume start with single cell generation 0
+# return vector of probabilities of seeing n cells
+# pN[nmax] = probability of seeing nmax or more cells
+# pdiff is the probability of differentiating (terminating)
+def gw_process(pdiff,nmax):
+    pN = np.zeros(nmax+1)
+    for i in xrange(1,nmax):
+        pN[i] = pdiff + (1 - pdiff)*(pN[i-1] ** 2)
+        # this is currently cumulative probability of having N progenitors
+    for i in xrange(1,nmax):
+        pN[nmax-i] = pN[nmax-i] - pN[nmax-i-1]
+    # put rest of probs in last entry
+    pN[nmax] = 1 - pN.sum()
+    return pN
+
+p = np.random.uniform()
+pdiff = np.random.uniform(0.5,1.0)
+pN = gw_process(pdiff,15)
+D,Nt,N1 = binary_variable_sim(20,p,pN)
+
+# print data
+print p,pdiff
+print D,Nt,N1
+
+ptry = np.linspace(0.51,0.99,10)
+fresults = []
+for i in xrange(len(ptry)):
+    C = BinaryVariableModel(D,gw_process(ptry[i],6))
+    fresults.append((C.estimate_p(),ptry[i],C.estimate_ll()))
+    print fresults[-1]
+    # print np.unravel_index(C.bweights.argmax(),C.bweights.shape)
+
+# convert log-likelihoods to probabilities
+presults = np.zeros(len(fresults))
+presults[0] = 1.0
+for i in xrange(1,len(fresults)):
+    presults[i] = presults[i-1]*np.exp(fresults[i][2] - fresults[i-1][2])
+
+presults = presults / presults.sum()
+
+
 '''
 
 # N is number of progenitors

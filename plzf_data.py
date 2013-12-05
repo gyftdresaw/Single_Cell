@@ -1,6 +1,7 @@
 
 import numpy as np
 from binary_fixed_pool import BinaryFixedModel
+from binary_variable_pool import BinaryVariableModel
 import matplotlib.pyplot as plt
 from scipy.misc import comb
 from scipy.stats import beta as beta_distr
@@ -87,4 +88,53 @@ for i in xrange(3):
     p = Bs[i].estimate_p()
     print binom.cdf(agg_D[i][1,1],T,(1 - p**3 - (1-p)**3))
 
+# terminating galton-watson process probabilities
+# assume start with single cell generation 0
+# return vector of probabilities of seeing n cells
+# pN[nmax] = probability of seeing nmax or more cells
+# pdiff is the probability of differentiating (terminating)
+def gw_process(pdiff,nmax):
+    pN = np.zeros(nmax+1)
+    for i in xrange(1,nmax):
+        pN[i] = pdiff + (1 - pdiff)*(pN[i-1] ** 2)
+        # this is currently cumulative probability of having N progenitors
+    for i in xrange(1,nmax):
+        pN[nmax-i] = pN[nmax-i] - pN[nmax-i-1]
+    # put rest of probs in last entry
+    pN[nmax] = 1 - pN.sum()
+    return pN
 
+plt.bar(range(100+1),gw_process(0.6,100),align='center')
+plt.show()
+
+# try some fitting to ilc data
+ptry = np.linspace(0.51,0.99,49)
+
+# for each aggregated data set
+# try to fit galton watson process
+fresults = []
+for j in xrange(3):
+    fresults.append([])
+    for i in xrange(len(ptry)):
+        C = BinaryVariableModel(np.round(agg_D[j]/2),gw_process(ptry[i],6))
+        fresults[j].append((C.estimate_p(),ptry[i],C.estimate_ll()))
+        print fresults[j][-1]
+        # print np.unravel_index(C.bweights.argmax(),C.bweights.shape)
+
+# convert log-likelihoods to probabilities
+presults = np.zeros((len(fresults[0]),3))
+presults[0,:] = 1.0
+for j in xrange(3):
+    for i in xrange(1,len(fresults[0])):
+        presults[i,j] = presults[i-1,j]*np.exp(fresults[j][i][2] - fresults[j][i-1][2])
+
+for j in xrange(3):
+    presults[:,j] = presults[:,j] / presults[:,j].sum()
+
+# plot these distributions for pdiff
+for j in xrange(3):
+    f = plt.figure()
+    plt.plot(ptry,presults[:,j])
+    plt.xlabel('prob differentiation')
+    f.savefig('pdiff_aggregate_ilc%d.png' % (j+1))
+    plt.show()
