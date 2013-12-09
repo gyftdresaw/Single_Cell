@@ -131,6 +131,7 @@ for j in xrange(3):
 for j in xrange(3):
     presults[:,j] = presults[:,j] / presults[:,j].sum()
 
+'''
 # plot these distributions for pdiff
 for j in xrange(3):
     f = plt.figure()
@@ -138,3 +139,6 @@ for j in xrange(3):
     plt.xlabel('prob differentiation')
     f.savefig('pdiff_aggregate_ilc%d.png' % (j+1))
     plt.show()
+'''
+
+
